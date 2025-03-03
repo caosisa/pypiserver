@@ -68,7 +68,6 @@ class auth:
         return protector
 
 
-@
 @lru_cache(maxsize=1024)
 def is_valid_pypi_package(package_name, version=None):
     """

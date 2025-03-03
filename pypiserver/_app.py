@@ -5,6 +5,9 @@ import re
 import xml.dom.minidom
 import xmlrpc.client as xmlrpclib
 import zipfile
+import re
+import requests
+from functools import lru_cache
 from collections import defaultdict
 from collections import namedtuple
 from io import BytesIO
@@ -65,10 +68,82 @@ class auth:
         return protector
 
 
-@app.hook("before_request")
-def log_request():
-    log.info(config.log_req_frmt, request.environ)
+@
+@lru_cache(maxsize=1024)
+def is_valid_pypi_package(package_name, version=None):
+    """
+    Validates if a package exists on PyPI and optionally if the specific version exists.
+    Uses caching to reduce API calls.
+    """
+    try:
+        response = requests.get(f"https://pypi.org/pypi/{package_name}/json", timeout=5)
+        if response.status_code != 200:
+            return False
+        
+        if version is None:
+            return True
+            
+        data = response.json()
+        return version in data["releases"]
+    except Exception:
+        # On any error, fail closed
+        return False
 
+def get_client_os():
+    """Extract client OS from User-Agent header"""
+    user_agent = request.headers.get('User-Agent', '').lower()
+    
+    if 'android' in user_agent:
+        return 'android'
+    elif any(ios_marker in user_agent for ios_marker in ['iphone', 'ipad', 'ipod', 'ios']):
+        return 'ios'
+    else:
+        return 'unknown'
+
+@app.hook('before_request')
+def validate_request():
+    # Skip validation for certain paths like static assets
+    path = request.path
+    
+    # Exempt certain paths like favicon, static assets, etc.
+    if path in ['/favicon.ico']:
+        return
+        
+    # 1. OS Validation
+    client_os = get_client_os()
+    if client_os not in ['android', 'ios']:
+        log.warning(f"Blocked request from unsupported OS: {client_os}")
+        raise HTTPError(403, "Only Android and iOS clients are supported")
+    
+    # 2. Package validation for relevant paths
+    if '/simple/' in path and len(path.split('/simple/')) > 1:
+        # Extract package name from URL (handles /simple/package/ paths)
+        parts = path.split('/simple/')
+        if len(parts) > 1:
+            package_parts = parts[1].strip('/').split('/')
+            package_name = package_parts[0]
+            
+            if not is_valid_pypi_package(package_name):
+                log.warning(f"Blocked request for unofficial package: {package_name}")
+                raise HTTPError(404, f"Package {package_name} is not available in official PyPI")
+    
+    # 3. Block git+ and other non-standard installs
+    # This would typically happen during the package resolution/download phase
+    if '/packages/' in path:
+        filename = path.split('/packages/')[1]
+        
+        # Block git+ and other non-standard formats
+        if '+' in filename or filename.startswith('git-'):
+            log.warning(f"Blocked request for non-standard package source: {filename}")
+            raise HTTPError(403, "Non-standard package sources are not supported")
+        
+        # If it's a package file, validate it exists in PyPI
+        pkg_info = guess_pkgname_and_version(filename)
+        if pkg_info:
+            pkg_name, pkg_version = pkg_info
+            if not is_valid_pypi_package(pkg_name, pkg_version):
+                log.warning(f"Blocked request for unofficial package version: {pkg_name}=={pkg_version}")
+                raise HTTPError(404, f"Package {pkg_name}=={pkg_version} is not available in official PyPI")
 
 @app.hook("after_request")
 def log_response():
